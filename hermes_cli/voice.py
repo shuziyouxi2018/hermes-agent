@@ -796,29 +796,57 @@ def speak_text(text: str) -> None:
         if not tts_text:
             return
 
-        # MP3 output path, pre-chosen so we can play the MP3 directly even
-        # when text_to_speech_tool auto-converts to OGG for messaging
-        # platforms.  afplay's OGG support is flaky, MP3 always works.
+        # SSH + PulseAudio: paplay plays OGG natively, MP3 needs GStreamer
         os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
-        mp3_path = os.path.join(
-            tempfile.gettempdir(),
-            "hermes_voice",
-            f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
-        )
+        if os.environ.get('PULSE_SERVER'):
+            # OGG preferred for SSH+PulseAudio (paplay native support)
+            out_path = os.path.join(
+                tempfile.gettempdir(),
+                "hermes_voice",
+                f"tts_{time.strftime('%Y%m%d_%H%M%S')}.ogg",
+            )
+        else:
+            # MP3 for local playback (afplay compatibility)
+            out_path = os.path.join(
+                tempfile.gettempdir(),
+                "hermes_voice",
+                f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
+            )
 
-        _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
-        text_to_speech_tool(text=tts_text, output_path=mp3_path)
+        _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {out_path}")
+        text_to_speech_tool(text=tts_text, output_path=out_path)
 
-        if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-            _debug(f"speak_text: playing {mp3_path} ({os.path.getsize(mp3_path)} bytes)")
-            play_audio_file(mp3_path)
-            try:
-                os.unlink(mp3_path)
-                ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                if os.path.isfile(ogg_path):
-                    os.unlink(ogg_path)
-            except OSError:
-                pass
+        # Check both .mp3 and .ogg since text_to_speech_tool may convert
+        played = False
+        for try_path in [out_path]:
+            if os.path.isfile(try_path) and os.path.getsize(try_path) > 0:
+                _debug(f"speak_text: playing {try_path} ({os.path.getsize(try_path)} bytes)")
+                play_audio_file(try_path)
+                try:
+                    os.unlink(try_path)
+                except OSError:
+                    pass
+                played = True
+                break
+        # Also check for the other format (tool may have converted)
+        if not played:
+            alt_ext = ".ogg" if out_path.endswith(".mp3") else ".mp3"
+            alt_path = out_path.rsplit(".", 1)[0] + alt_ext
+            if os.path.isfile(alt_path) and os.path.getsize(alt_path) > 0:
+                _debug(f"speak_text: playing alt format {alt_path}")
+                play_audio_file(alt_path)
+                try:
+                    os.unlink(alt_path)
+                except OSError:
+                    pass
+        # Clean up any leftover
+        for suffix in [".mp3", ".ogg"]:
+            clean_path = out_path.rsplit(".", 1)[0] + suffix
+            if os.path.isfile(clean_path):
+                try:
+                    os.unlink(clean_path)
+                except OSError:
+                    pass
         else:
             _debug(f"speak_text: TTS tool produced no audio at {mp3_path}")
     except Exception as e:

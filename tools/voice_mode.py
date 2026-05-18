@@ -100,7 +100,10 @@ def detect_audio_environment() -> dict:
 
     # SSH detection
     if any(os.environ.get(v) for v in ('SSH_CLIENT', 'SSH_TTY', 'SSH_CONNECTION')):
-        warnings.append("Running over SSH -- no audio devices available")
+        if os.environ.get('PULSE_SERVER'):
+            notices.append("Running over SSH with PulseAudio tunnel (PULSE_SERVER set)")
+        else:
+            warnings.append("Running over SSH -- no audio devices available")
 
     # Docker/Podman container detection
     from hermes_constants import is_container
@@ -201,13 +204,55 @@ _TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
 # Audio cues (beep tones)
 # ============================================================================
 def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> None:
-    """Play a short beep tone using numpy + sounddevice.
+    """Play a short beep tone using numpy + sounddevice or paplay.
 
     Args:
         frequency: Tone frequency in Hz (default 880 = A5).
         duration: Duration of each beep in seconds.
         count: Number of beeps to play (with short gap between).
     """
+    # SSH + PulseAudio: use paplay to avoid sounddevice paInvalidSampleRate
+    if os.environ.get('PULSE_SERVER'):
+        paplay_exe = shutil.which("paplay")
+        if paplay_exe:
+            try:
+                # Generate a WAV beep and pipe to paplay
+                _, np = _import_audio()
+                gap = 0.06
+                samples_per_beep = int(SAMPLE_RATE * duration)
+                samples_per_gap = int(SAMPLE_RATE * gap)
+                parts = []
+                for i in range(count):
+                    t = np.linspace(0, duration, samples_per_beep, endpoint=False)
+                    tone = np.sin(2 * np.pi * frequency * t)
+                    fade_len = min(int(SAMPLE_RATE * 0.01), samples_per_beep // 4)
+                    tone[:fade_len] *= np.linspace(0, 1, fade_len)
+                    tone[-fade_len:] *= np.linspace(1, 0, fade_len)
+                    parts.append((tone * 0.3 * 32767).astype(np.int16))
+                    if i < count - 1:
+                        parts.append(np.zeros(samples_per_gap, dtype=np.int16))
+                audio = np.concatenate(parts)
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                with wave.open(tmp_path, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(SAMPLE_RATE)
+                    wf.writeframes(audio.tobytes())
+                proc = subprocess.Popen(
+                    [paplay_exe, tmp_path],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                proc.wait(timeout=5)
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                return
+            except Exception as e:
+                logger.debug("play_beep paplay fallback: %s", e)
+        # paplay not available, fall through to sounddevice
     try:
         sd, np = _import_audio()
     except (ImportError, OSError):
@@ -722,10 +767,223 @@ class AudioRecorder:
         return wav_path
 
 
-def create_audio_recorder() -> AudioRecorder | TermuxAudioRecorder:
+
+# ============================================================================
+# ArecordAudioRecorder -- SSH + PulseAudio recorder via arecord subprocess
+# ============================================================================
+class ArecordAudioRecorder:
+    """Record audio via `arecord -D pulse` subprocess over SSH PulseAudio tunnel.
+
+    Used when PULSE_SERVER is set (SSH voice mode). Records raw PCM at 48kHz
+    stereo, computes RMS for silence detection, and writes WAV on stop.
+    """
+
+    supports_silence_autostop = True
+    PULSE_SAMPLE_RATE = 48000
+    PULSE_CHANNELS = 2
+    PULSE_SAMPLE_WIDTH = 2  # 16-bit
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: Optional[subprocess.Popen] = None
+        self._frames: List[bytes] = []
+        self._recording = False
+        self._start_time: float = 0.0
+        self._silence_start: float = 0.0
+        self._has_spoken = False
+        self._speech_start: float = 0.0
+        self._min_speech_duration: float = 0.3
+        self._max_dip_tolerance: float = 0.3
+        self._resume_start: float = 0.0
+        self._resume_dip_start: float = 0.0
+        self._dip_start: float = 0.0
+        self._on_silence_stop = None
+        self._silence_threshold: int = SILENCE_RMS_THRESHOLD
+        self._silence_duration: float = SILENCE_DURATION_SECONDS
+        self._max_wait: float = 15.0
+        self._peak_rms: int = 0
+        self._current_rms: int = 0
+        self._read_thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
+
+    @property
+    def elapsed_seconds(self) -> float:
+        if not self._recording:
+            return 0.0
+        return time.monotonic() - self._start_time
+
+    @property
+    def current_rms(self) -> int:
+        return self._current_rms
+
+    @property
+    def is_recording(self) -> bool:
+        return self._recording
+
+    def start(self, on_silence_stop: Optional[callable] = None) -> None:
+        with self._lock:
+            if self._recording:
+                return
+            self._recording = True
+            self._start_time = time.monotonic()
+            self._frames = []
+            self._peak_rms = 0
+            self._current_rms = 0
+            self._has_spoken = False
+            self._speech_start = 0.0
+            self._silence_start = 0.0
+            self._resume_start = 0.0
+            self._resume_dip_start = 0.0
+            self._dip_start = 0.0
+            self._stop_event.clear()
+            self._on_silence_stop = on_silence_stop
+
+            cmd = [
+                "arecord", "-D", "pulse",
+                "-f", "S16_LE",
+                "-r", str(self.PULSE_SAMPLE_RATE),
+                "-c", str(self.PULSE_CHANNELS),
+                "-t", "raw",
+            ]
+            try:
+                self._process = subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+                )
+                self._read_thread = threading.Thread(target=self._read_loop, daemon=True)
+                self._read_thread.start()
+            except Exception as e:
+                logger.warning("ArecordAudioRecorder start failed: %s", e)
+                self._recording = False
+
+    def _read_loop(self) -> None:
+        """Background thread: read raw PCM from arecord stdout."""
+        chunk_size = 4096  # 20ms at 48kHz stereo = 1920 bytes, use 4096 for safety
+        try:
+            while not self._stop_event.is_set() and self._process:
+                data = self._process.stdout.read(chunk_size)
+                if not data:
+                    break
+                with self._lock:
+                    if not self._recording:
+                        continue
+                    self._frames.append(data)
+                    # Compute RMS
+                    import struct
+                    samples = struct.unpack(f"{len(data)//self.PULSE_SAMPLE_WIDTH}h", data[:len(data) - len(data) % self.PULSE_SAMPLE_WIDTH])
+                    if samples:
+                        rms = int((sum(s * s for s in samples) / len(samples)) ** 0.5)
+                        self._current_rms = rms
+                        self._peak_rms = max(self._peak_rms, rms)
+                        # Silence detection (same logic as AudioRecorder)
+                        if self._on_silence_stop is not None:
+                            now = time.monotonic()
+                            if rms > self._silence_threshold:
+                                self._dip_start = 0.0
+                                if self._speech_start == 0.0:
+                                    self._speech_start = now
+                                elif not self._has_spoken and now - self._speech_start >= self._min_speech_duration:
+                                    self._has_spoken = True
+                                if not self._has_spoken:
+                                    self._silence_start = 0.0
+                                else:
+                                    self._resume_dip_start = 0.0
+                                    if self._resume_start == 0.0:
+                                        self._resume_start = now
+                                    elif now - self._resume_start >= self._min_speech_duration:
+                                        self._silence_start = 0.0
+                                        self._resume_start = 0.0
+                            elif self._has_spoken:
+                                if self._resume_start > 0:
+                                    if self._resume_dip_start == 0.0:
+                                        self._resume_dip_start = now
+                                    elif now - self._resume_dip_start >= self._max_dip_tolerance:
+                                        self._resume_start = 0.0
+                                        self._resume_dip_start = 0.0
+                                elif self._silence_start == 0.0:
+                                    self._silence_start = now
+                                elif self._silence_start > 0 and now - self._silence_start >= self._silence_duration:
+                                    self._fire_silence()
+                            # Max wait
+                            elapsed = now - self._start_time
+                            if elapsed >= self._max_wait and not self._has_spoken:
+                                self._fire_silence()
+        except Exception as e:
+            logger.debug("ArecordAudioRecorder read loop ended: %s", e)
+        finally:
+            with self._lock:
+                if self._process:
+                    try:
+                        self._process.stdout.close()
+                    except Exception:
+                        pass
+
+    def _fire_silence(self) -> None:
+        """Call on_silence_stop callback (must be called with lock held)."""
+        if self._on_silence_stop:
+            try:
+                self._on_silence_stop()
+            except Exception as e:
+                logger.debug("Arecord silence callback error: %s", e)
+
+    def stop(self) -> Optional[str]:
+        with self._lock:
+            if not self._recording:
+                return None
+            self._recording = False
+            self._stop_event.set()
+        if self._read_thread:
+            self._read_thread.join(timeout=3)
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+        with self._lock:
+            all_data = b''.join(self._frames)
+        if not all_data:
+            return None
+        # Write WAV
+        wav_path = os.path.join(tempfile.gettempdir(), f"hermes_voice_arecord_{time.strftime('%Y%m%d_%H%M%S')}.wav")
+        try:
+            with wave.open(wav_path, "wb") as wf:
+                wf.setnchannels(self.PULSE_CHANNELS)
+                wf.setsampwidth(self.PULSE_SAMPLE_WIDTH)
+                wf.setframerate(self.PULSE_SAMPLE_RATE)
+                wf.writeframes(all_data)
+            return wav_path
+        except Exception as e:
+            logger.warning("ArecordAudioRecorder WAV write failed: %s", e)
+            return None
+
+    def cancel(self) -> None:
+        with self._lock:
+            self._recording = False
+            self._stop_event.set()
+        if self._read_thread:
+            self._read_thread.join(timeout=2)
+        if self._process:
+            try:
+                self._process.terminate()
+                self._process.wait(timeout=2)
+            except Exception:
+                try:
+                    self._process.kill()
+                except Exception:
+                    pass
+
+
+
+def create_audio_recorder() -> AudioRecorder | TermuxAudioRecorder | ArecordAudioRecorder:
     """Return the best recorder backend for the current environment."""
     if _termux_voice_capture_available():
         return TermuxAudioRecorder()
+    # SSH + PulseAudio tunnel: use arecord-based recorder
+    if os.environ.get('PULSE_SERVER'):
+        return ArecordAudioRecorder()
     return AudioRecorder()
 
 
@@ -887,10 +1145,17 @@ def play_audio_file(file_path: str) -> bool:
     system = platform.system()
     players = []
 
-    if system == "Darwin":
+    # SSH + PulseAudio: paplay is priority-1 (handles OGG/Opus, MP3, WAV)
+    if os.environ.get('PULSE_SERVER'):
+        paplay_exe = shutil.which("paplay")
+        if paplay_exe:
+            players.append(["paplay", file_path])
+        else:
+            players.append(["aplay", "-D", "pulse", file_path])
+    elif system == "Darwin":
         players.append(["afplay", file_path])
     players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
-    if system == "Linux":
+    if system == "Linux" and not os.environ.get('PULSE_SERVER'):
         players.append(["aplay", "-q", file_path])
 
     for cmd in players:

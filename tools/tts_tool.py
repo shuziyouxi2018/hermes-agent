@@ -9,7 +9,7 @@ Built-in TTS providers:
 - MiniMax TTS: High-quality with voice cloning, needs MINIMAX_API_KEY
 - Mistral (Voxtral TTS): Multilingual, native Opus, needs MISTRAL_API_KEY
 - Google Gemini TTS: Controllable, 30 prebuilt voices, needs GEMINI_API_KEY
-- xAI TTS: Grok voices, uses xAI Grok OAuth credentials or XAI_API_KEY
+- xAI TTS: Grok voices, needs XAI_API_KEY
 - NeuTTS (local, free, no API key): On-device TTS via neutts
 - KittenTTS (local, free, no API key): On-device 25MB model
 - Piper (local, free, no API key): OHF-Voice/piper1-gpl neural VITS, 44 languages
@@ -44,6 +44,7 @@ import queue
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
@@ -901,12 +902,9 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     """
     import requests
 
-    from tools.xai_http import resolve_xai_http_credentials
-
-    creds = resolve_xai_http_credentials()
-    api_key = str(creds.get("api_key") or "").strip()
+    api_key = (get_env_value("XAI_API_KEY") or "").strip()
     if not api_key:
-        raise ValueError("No xAI credentials found. Configure xAI OAuth in `hermes model` or set XAI_API_KEY.")
+        raise ValueError("XAI_API_KEY not set. Get one at https://console.x.ai/")
 
     xai_config = tts_config.get("xai", {})
     voice_id = str(xai_config.get("voice_id", DEFAULT_XAI_VOICE_ID)).strip() or DEFAULT_XAI_VOICE_ID
@@ -915,7 +913,6 @@ def _generate_xai_tts(text: str, output_path: str, tts_config: Dict[str, Any]) -
     bit_rate = int(xai_config.get("bit_rate", DEFAULT_XAI_BIT_RATE))
     base_url = str(
         xai_config.get("base_url")
-        or creds.get("base_url")
         or get_env_value("XAI_BASE_URL")
         or DEFAULT_XAI_BASE_URL
     ).strip().rstrip("/")
@@ -1920,13 +1917,8 @@ def check_tts_requirements() -> bool:
         pass
     if get_env_value("MINIMAX_API_KEY"):
         return True
-    try:
-        from tools.xai_http import resolve_xai_http_credentials
-
-        if resolve_xai_http_credentials().get("api_key"):
-            return True
-    except Exception:
-        pass
+    if get_env_value("XAI_API_KEY"):
+        return True
     if get_env_value("GEMINI_API_KEY") or get_env_value("GOOGLE_API_KEY"):
         return True
     try:
@@ -2058,19 +2050,25 @@ def stream_tts_to_speaker(
             # Open a single sounddevice output stream for the lifetime of
             # this function.  ElevenLabs pcm_24000 produces signed 16-bit
             # little-endian mono PCM at 24 kHz.
+            # SSH + PulseAudio: sounddevice OutputStream may not work via
+            # PulseAudio tunnel, so skip it and let fallback handle playback.
             if client is not None:
-                try:
-                    sd = _import_sounddevice()
-                    output_stream = sd.OutputStream(
-                        samplerate=24000, channels=1, dtype="int16",
-                    )
-                    output_stream.start()
-                except (ImportError, OSError) as exc:
-                    logger.debug("sounddevice not available: %s", exc)
+                if os.environ.get('PULSE_SERVER'):
+                    logger.debug("PULSE_SERVER set; skipping sounddevice OutputStream for streaming TTS")
                     output_stream = None
-                except Exception as exc:
-                    logger.warning("sounddevice OutputStream failed: %s", exc)
-                    output_stream = None
+                else:
+                    try:
+                        sd = _import_sounddevice()
+                        output_stream = sd.OutputStream(
+                            samplerate=24000, channels=1, dtype="int16",
+                        )
+                        output_stream.start()
+                    except (ImportError, OSError) as exc:
+                        logger.debug("sounddevice not available: %s", exc)
+                        output_stream = None
+                    except Exception as exc:
+                        logger.warning("sounddevice OutputStream failed: %s", exc)
+                        output_stream = None
 
         sentence_buf = ""
         min_sentence_len = 20
