@@ -681,12 +681,19 @@ def _resolve_runtime_agent_kwargs() -> dict:
     from hermes_cli.runtime_provider import (
         resolve_runtime_provider,
         format_runtime_provider_error,
+        _get_model_config,
     )
     from hermes_cli.auth import AuthError
+
+    _model_cfg = _get_model_config()
+    _cfg_base_url = str(_model_cfg.get("base_url") or "").strip().rstrip("/")
+    _cfg_api_key = str(_model_cfg.get("api_key") or "").strip()
 
     try:
         runtime = resolve_runtime_provider(
             requested=os.getenv("HERMES_INFERENCE_PROVIDER"),
+            explicit_api_key=_cfg_api_key or None,
+            explicit_base_url=_cfg_base_url or None,
         )
     except AuthError as auth_exc:
         # Primary provider auth failed (expired token, revoked key, etc.).
