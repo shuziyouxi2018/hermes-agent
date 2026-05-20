@@ -9937,18 +9937,18 @@ class HermesCLI:
             with self._voice_lock:
                 if not self._voice_recording:
                     return
-            _cprint(f"\n{_DIM}Silence detected, auto-stopping...{_RST}")
+            # _cprint(f"\n{_DIM}Silence detected, auto-stopping...{_RST}")
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
             self._voice_stop_and_transcribe()
 
         # Audio cue: single beep BEFORE starting stream (avoid CoreAudio conflict)
-        if self._voice_beeps_enabled():
-            try:
-                from tools.voice_mode import play_beep
-                play_beep(frequency=880, count=1)
-            except Exception:
-                pass
+        # if self._voice_beeps_enabled():
+        #     try:
+        #         from tools.voice_mode import play_beep
+        #         play_beep(frequency=880, count=1)
+        #     except Exception:
+        #         pass
 
         try:
             self._voice_recorder.start(on_silence_stop=_on_silence)
@@ -9963,7 +9963,20 @@ class HermesCLI:
             _recording_hint = f"Termux:API capture | {_label} to stop"
         else:
             _recording_hint = f"{_label} to stop"
-        _cprint(f"\n{_ACCENT}● Recording...{_RST} {_DIM}({_recording_hint}){_RST}")
+
+        # Only show "Recording..." after speech is actually detected
+        def _show_recording_on_speech():
+            for _ in range(200):  # max ~30s wait
+                time.sleep(0.15)
+                with self._voice_lock:
+                    if not self._voice_recording:
+                        return
+                rec = self._voice_recorder
+                if hasattr(rec, '_has_spoken') and rec._has_spoken:
+                    _cprint(f"\n{_ACCENT}● Recording...{_RST} {_DIM}({_recording_hint}){_RST}")
+                    break
+
+        threading.Thread(target=_show_recording_on_speech, daemon=True).start()
 
         # Periodically refresh prompt to update audio level indicator
         def _refresh_level():
@@ -9996,22 +10009,23 @@ class HermesCLI:
 
             wav_path = self._voice_recorder.stop()
 
-            # Audio cue: double beep after stream stopped (no CoreAudio conflict)
-            if self._voice_beeps_enabled():
-                try:
-                    from tools.voice_mode import play_beep
-                    play_beep(frequency=660, count=2)
-                except Exception:
-                    pass
+            # Audio cue: double beep ONLY after valid transcript (no CoreAudio conflict)
+            # Moved to after transcription check below
+            # if self._voice_beeps_enabled():
+            #     try:
+            #         from tools.voice_mode import play_beep
+            #         play_beep(frequency=660, count=2)
+            #     except Exception:
+            #         pass
 
             if wav_path is None:
-                _cprint(f"{_DIM}No speech detected.{_RST}")
+                # _cprint(f"{_DIM}No speech detected.{_RST}")
                 return
 
             # _voice_processing is already True (set atomically above)
             if hasattr(self, '_app') and self._app:
                 self._app.invalidate()
-            _cprint(f"{_DIM}Transcribing...{_RST}")
+            # _cprint(f"{_DIM}Transcribing...{_RST}")
 
             # Get STT model from config
             stt_model = None
@@ -10022,18 +10036,23 @@ class HermesCLI:
             except Exception:
                 pass
 
-            from tools.voice_mode import transcribe_recording
+            from tools.voice_mode import transcribe_recording, _strip_quotes
             result = transcribe_recording(wav_path, model=stt_model)
 
             if result.get("success") and result.get("transcript", "").strip():
-                transcript = result["transcript"].strip()
-                self._attached_images.clear()
-                if hasattr(self, '_app') and self._app:
-                    self._app.invalidate()
-                self._pending_input.put(transcript)
-                submitted = True
+                transcript = _strip_quotes(result["transcript"]).strip()
+                if transcript:
+                    self._attached_images.clear()
+                    if hasattr(self, '_app') and self._app:
+                        self._app.invalidate()
+                    self._pending_input.put(transcript)
+                    submitted = True
+                else:
+                    # _cprint(f"{_DIM}No speech detected.{_RST}")
+                    pass
             elif result.get("success"):
-                _cprint(f"{_DIM}No speech detected.{_RST}")
+                # _cprint(f"{_DIM}No speech detected.{_RST}")
+                pass
             else:
                 error = result.get("error", "Unknown error")
                 _cprint(f"\n{_DIM}Transcription failed: {error}{_RST}")
@@ -10055,10 +10074,10 @@ class HermesCLI:
             # Track consecutive no-speech cycles to avoid infinite restart loops.
             if not submitted:
                 self._no_speech_count = getattr(self, '_no_speech_count', 0) + 1
-                if self._no_speech_count >= 3:
+                if self._no_speech_count >= 86400:
                     self._voice_continuous = False
                     self._no_speech_count = 0
-                    _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
+                    _cprint(f"{_DIM}No speech detected 86400 times, continuous mode stopped.{_RST}")
                     return
             else:
                 self._no_speech_count = 0

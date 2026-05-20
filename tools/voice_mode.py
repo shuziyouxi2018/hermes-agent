@@ -803,6 +803,8 @@ class ArecordAudioRecorder:
         self._max_wait: float = 15.0
         self._peak_rms: int = 0
         self._current_rms: int = 0
+        # Adaptive noise floor for SSH PulseAudio tunnel
+        self._noise_floor: int = 0
         self._read_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
 
@@ -874,10 +876,22 @@ class ArecordAudioRecorder:
                         rms = int((sum(s * s for s in samples) / len(samples)) ** 0.5)
                         self._current_rms = rms
                         self._peak_rms = max(self._peak_rms, rms)
-                        # Silence detection (same logic as AudioRecorder)
+
+                        # Silence detection threshold from config
+                        effective_threshold = self._silence_threshold
+
+                        # DEBUG: log RMS every 50 chunks
+                        _chk = len(self._frames)
+                        if _chk % 50 == 0:
+                            logger.info("Arecord DEBUG: chunk=%d rms=%d peak=%d thresh=%d has_spoken=%s silence=%s",
+                                _chk, rms, self._peak_rms, effective_threshold, self._has_spoken, self._silence_start)
+                        # Silence detection (aligned with AudioRecorder logic)
                         if self._on_silence_stop is not None:
                             now = time.monotonic()
-                            if rms > self._silence_threshold:
+                            elapsed = now - self._start_time
+
+                            if rms > effective_threshold:
+                                # Audio above threshold -- speech (or noise)
                                 self._dip_start = 0.0
                                 if self._speech_start == 0.0:
                                     self._speech_start = now
@@ -886,26 +900,41 @@ class ArecordAudioRecorder:
                                 if not self._has_spoken:
                                     self._silence_start = 0.0
                                 else:
+                                    # Already spoke -- any audio above threshold
+                                    # resets the silence timer immediately.
+                                    self._silence_start = 0.0
                                     self._resume_dip_start = 0.0
-                                    if self._resume_start == 0.0:
-                                        self._resume_start = now
-                                    elif now - self._resume_start >= self._min_speech_duration:
-                                        self._silence_start = 0.0
-                                        self._resume_start = 0.0
+                                    self._resume_start = 0.0
+                                    self._dip_start = 0.0
                             elif self._has_spoken:
+                                # Below threshold after speech confirmed
                                 if self._resume_start > 0:
                                     if self._resume_dip_start == 0.0:
                                         self._resume_dip_start = now
                                     elif now - self._resume_dip_start >= self._max_dip_tolerance:
                                         self._resume_start = 0.0
                                         self._resume_dip_start = 0.0
-                                elif self._silence_start == 0.0:
+                            elif self._speech_start > 0 and self._dip_start == 0.0:
+                                self._dip_start = now
+                            elif self._dip_start > 0 and now - self._dip_start >= self._max_dip_tolerance:
+                                self._speech_start = 0.0
+                                self._dip_start = 0.0
+
+                            # Fire silence when: spoke then silent, or max_wait with no speech
+                            should_fire = False
+                            if self._has_spoken and rms <= effective_threshold:
+                                if self._silence_start == 0.0:
                                     self._silence_start = now
-                                elif self._silence_start > 0 and now - self._silence_start >= self._silence_duration:
-                                    self._fire_silence()
-                            # Max wait
-                            elapsed = now - self._start_time
-                            if elapsed >= self._max_wait and not self._has_spoken:
+                                elif now - self._silence_start >= self._silence_duration:
+                                    logger.info("Arecord silence detected (%.1fs), auto-stopping",
+                                                self._silence_duration)
+                                    should_fire = True
+                            elif not self._has_spoken and elapsed >= self._max_wait:
+                                logger.info("Arecord no speech within %.0fs, auto-stopping",
+                                            self._max_wait)
+                                should_fire = True
+
+                            if should_fire:
                                 self._fire_silence()
         except Exception as e:
             logger.debug("ArecordAudioRecorder read loop ended: %s", e)
@@ -918,12 +947,24 @@ class ArecordAudioRecorder:
                         pass
 
     def _fire_silence(self) -> None:
-        """Call on_silence_stop callback (must be called with lock held)."""
-        if self._on_silence_stop:
+        """Call on_silence_stop callback once.
+        
+        Note: called from _read_loop with lock held, so release the lock
+        before calling the callback to avoid deadlock (callback calls stop()
+        which also acquires the lock).
+        """
+        # Grab and clear the callback under lock
+        cb = self._on_silence_stop
+        self._on_silence_stop = None
+        if cb:
+            # Release lock for the callback
+            self._lock.release()
             try:
-                self._on_silence_stop()
+                cb()
             except Exception as e:
                 logger.debug("Arecord silence callback error: %s", e)
+            finally:
+                self._lock.acquire()
 
     def stop(self) -> Optional[str]:
         with self._lock:
@@ -931,7 +972,9 @@ class ArecordAudioRecorder:
                 return None
             self._recording = False
             self._stop_event.set()
-        if self._read_thread:
+        # Join read thread, but skip if called from the read thread itself
+        # (happens when silence callback fires from _read_loop)
+        if self._read_thread and self._read_thread is not threading.current_thread():
             self._read_thread.join(timeout=3)
         if self._process:
             try:
@@ -945,6 +988,11 @@ class ArecordAudioRecorder:
         with self._lock:
             all_data = b''.join(self._frames)
         if not all_data:
+            return None
+        # Skip silent recordings using peak RMS
+        if self._peak_rms < self._silence_threshold:
+            logger.info("Arecord recording too quiet (peak RMS=%d < %d), discarding",
+                        self._peak_rms, self._silence_threshold)
             return None
         # Write WAV
         wav_path = os.path.join(tempfile.gettempdir(), f"hermes_voice_arecord_{time.strftime('%Y%m%d_%H%M%S')}.wav")
@@ -1028,9 +1076,20 @@ _HALLUCINATION_REPEAT_RE = re.compile(
 )
 
 
+def _strip_quotes(s: str) -> str:
+    """Strip surrounding quotes and whitespace from transcript.
+
+    Handles: "text", 'text', ""text"", ''text''  etc.
+    """
+    s = s.strip()
+    while len(s) >= 2 and (s[0] == s[-1] == '"' or s[0] == s[-1] == "'"):
+        s = s[1:-1].strip()
+    return s
+
+
 def is_whisper_hallucination(transcript: str) -> bool:
     """Check if a transcript is a known Whisper hallucination on silence."""
-    cleaned = transcript.strip().lower()
+    cleaned = _strip_quotes(transcript).strip().lower()
     if not cleaned:
         return True
     # Exact match against known phrases
@@ -1065,6 +1124,12 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
     # Filter out Whisper hallucinations (common on silent/near-silent audio)
     if result.get("success") and is_whisper_hallucination(result.get("transcript", "")):
         logger.info("Filtered Whisper hallucination: %r", result["transcript"])
+        return {"success": True, "transcript": "", "filtered": True}
+
+    # Also filter very short transcripts (1-5 chars) as likely noise
+    txt = result.get("transcript", "")
+    if result.get("success") and 0 < len(txt.strip().strip("'\"")) <= 5:
+        logger.info("Filtered short transcript (%d chars): %r", len(txt), txt)
         return {"success": True, "transcript": "", "filtered": True}
 
     return result
