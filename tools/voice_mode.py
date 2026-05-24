@@ -204,55 +204,62 @@ _TEMP_DIR = os.path.join(tempfile.gettempdir(), "hermes_voice")
 # Audio cues (beep tones)
 # ============================================================================
 def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> None:
-    """Play a short beep tone using numpy + sounddevice or paplay.
+    """Play a short beep tone using numpy + sounddevice or ffplay.
 
     Args:
         frequency: Tone frequency in Hz (default 880 = A5).
         duration: Duration of each beep in seconds.
         count: Number of beeps to play (with short gap between).
     """
-    # SSH + PulseAudio: use paplay to avoid sounddevice paInvalidSampleRate
+    import logging
+    _logger = logging.getLogger(__name__)
+    _logger.info(f"[BEEP_DEBUG] play_beep called: freq={frequency}, count={count}, PULSE_SERVER={os.environ.get('PULSE_SERVER')}")
+    # SSH + PulseAudio: use ffplay for reliability (same as audio playback)
     if os.environ.get('PULSE_SERVER'):
-        paplay_exe = shutil.which("paplay")
-        if paplay_exe:
+        _logger.info("[BEEP_DEBUG] entering PULSE_SERVER branch")
+        try:
+            _, np = _import_audio()
+            gap = 0.06
+            samples_per_beep = int(SAMPLE_RATE * duration)
+            samples_per_gap = int(SAMPLE_RATE * gap)
+            parts = []
+            for i in range(count):
+                t = np.linspace(0, duration, samples_per_beep, endpoint=False)
+                tone = np.sin(2 * np.pi * frequency * t)
+                fade_len = min(int(SAMPLE_RATE * 0.01), samples_per_beep // 4)
+                tone[:fade_len] *= np.linspace(0, 1, fade_len)
+                tone[-fade_len:] *= np.linspace(1, 0, fade_len)
+                parts.append((tone * 0.3 * 32767).astype(np.int16))
+                if i < count - 1:
+                    parts.append(np.zeros(samples_per_gap, dtype=np.int16))
+            audio = np.concatenate(parts)
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp_path = tmp.name
+            tmp.close()
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(SAMPLE_RATE)
+                wf.writeframes(audio.tobytes())
+            _logger.info(f"[BEEP_DEBUG] wrote wav: {tmp_path}")
+            # ffplay with -nodisp -autoexit -frames:v 1 for fast exit on SSH
+            proc = subprocess.Popen(
+                ["ffplay", "-nodisp", "-autoexit", "-frames:v", "1", "-loglevel", "quiet", tmp_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            rc = proc.wait(timeout=10)
+            _logger.info(f"[BEEP_DEBUG] ffplay exit code: {rc}")
             try:
-                # Generate a WAV beep and pipe to paplay
-                _, np = _import_audio()
-                gap = 0.06
-                samples_per_beep = int(SAMPLE_RATE * duration)
-                samples_per_gap = int(SAMPLE_RATE * gap)
-                parts = []
-                for i in range(count):
-                    t = np.linspace(0, duration, samples_per_beep, endpoint=False)
-                    tone = np.sin(2 * np.pi * frequency * t)
-                    fade_len = min(int(SAMPLE_RATE * 0.01), samples_per_beep // 4)
-                    tone[:fade_len] *= np.linspace(0, 1, fade_len)
-                    tone[-fade_len:] *= np.linspace(1, 0, fade_len)
-                    parts.append((tone * 0.3 * 32767).astype(np.int16))
-                    if i < count - 1:
-                        parts.append(np.zeros(samples_per_gap, dtype=np.int16))
-                audio = np.concatenate(parts)
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp_path = tmp.name
-                tmp.close()
-                with wave.open(tmp_path, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)
-                    wf.setframerate(SAMPLE_RATE)
-                    wf.writeframes(audio.tobytes())
-                proc = subprocess.Popen(
-                    [paplay_exe, tmp_path],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                proc.wait(timeout=5)
-                try:
-                    os.unlink(tmp_path)
-                except OSError:
-                    pass
-                return
-            except Exception as e:
-                logger.debug("play_beep paplay fallback: %s", e)
-        # paplay not available, fall through to sounddevice
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        except Exception as e:
+            logger.debug("play_beep ffplay: %s", e)
+        # ffplay done, fall through to sounddevice if needed
     try:
         sd, np = _import_audio()
     except (ImportError, OSError):

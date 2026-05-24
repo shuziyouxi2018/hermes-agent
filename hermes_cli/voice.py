@@ -265,7 +265,11 @@ def _play_beep(frequency: int, count: int = 1) -> None:
     Best-effort — sounddevice failures are silently swallowed so the
     voice loop never breaks because a speaker was unavailable.
     """
-    if not _beeps_enabled():
+    import logging
+    _logger = logging.getLogger(__name__)
+    enabled = _beeps_enabled()
+    _logger.info(f"[BEEP_VOICE] _play_beep called: freq={frequency}, count={count}, enabled={enabled}")
+    if not enabled:
         return
     try:
         from tools.voice_mode import play_beep

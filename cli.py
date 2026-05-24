@@ -10423,13 +10423,13 @@ class HermesCLI:
                 self._app.invalidate()
             self._voice_stop_and_transcribe()
 
-        # Audio cue: single beep BEFORE starting stream (avoid CoreAudio conflict)
-        # if self._voice_beeps_enabled():
-        #     try:
-        #         from tools.voice_mode import play_beep
-        #         play_beep(frequency=880, count=1)
-        #     except Exception:
-        #         pass
+        # Audio cue: single beep BEFORE starting stream
+        if self._voice_beeps_enabled():
+            try:
+                from tools.voice_mode import play_beep
+                play_beep(frequency=880, count=1)
+            except Exception:
+                pass
 
         try:
             self._voice_recorder.start(on_silence_stop=_on_silence)
@@ -10491,14 +10491,13 @@ class HermesCLI:
 
             wav_path = self._voice_recorder.stop()
 
-            # Audio cue: double beep ONLY after valid transcript (no CoreAudio conflict)
-            # Moved to after transcription check below
-            # if self._voice_beeps_enabled():
-            #     try:
-            #         from tools.voice_mode import play_beep
-            #         play_beep(frequency=660, count=2)
-            #     except Exception:
-            #         pass
+            # Audio cue: double beep after silence stop
+            if self._voice_beeps_enabled():
+                try:
+                    from tools.voice_mode import play_beep
+                    play_beep(frequency=660, count=2)
+                except Exception:
+                    pass
 
             if wav_path is None:
                 # _cprint(f"{_DIM}No speech detected.{_RST}")
