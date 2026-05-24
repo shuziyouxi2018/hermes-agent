@@ -229,7 +229,7 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
                 fade_len = min(int(SAMPLE_RATE * 0.01), samples_per_beep // 4)
                 tone[:fade_len] *= np.linspace(0, 1, fade_len)
                 tone[-fade_len:] *= np.linspace(1, 0, fade_len)
-                parts.append((tone * 0.3 * 32767).astype(np.int16))
+                parts.append((tone * 0.8 * 32767).astype(np.int16))
                 if i < count - 1:
                     parts.append(np.zeros(samples_per_gap, dtype=np.int16))
             audio = np.concatenate(parts)
@@ -277,7 +277,7 @@ def play_beep(frequency: int = 880, duration: float = 0.12, count: int = 1) -> N
             fade_len = min(int(SAMPLE_RATE * 0.01), samples_per_beep // 4)
             tone[:fade_len] *= np.linspace(0, 1, fade_len)
             tone[-fade_len:] *= np.linspace(1, 0, fade_len)
-            parts.append((tone * 0.3 * 32767).astype(np.int16))
+            parts.append((tone * 0.8 * 32767).astype(np.int16))
             if i < count - 1:
                 parts.append(np.zeros(samples_per_gap, dtype=np.int16))
 
