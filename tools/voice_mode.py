@@ -1210,13 +1210,9 @@ def play_audio_file(file_path: str) -> bool:
     system = platform.system()
     players = []
 
-    # SSH + PulseAudio: paplay is priority-1 (handles OGG/Opus, MP3, WAV)
+    # SSH + PulseAudio: ffplay is most reliable (handles OGG/Opus, MP3, WAV)
     if os.environ.get('PULSE_SERVER'):
-        paplay_exe = shutil.which("paplay")
-        if paplay_exe:
-            players.append(["paplay", file_path])
-        else:
-            players.append(["aplay", "-D", "pulse", file_path])
+        players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
     elif system == "Darwin":
         players.append(["afplay", file_path])
     players.append(["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", file_path])
