@@ -129,6 +129,7 @@ from hermes_constants import get_hermes_dir as _get_hermes_dir
 
 _STORE_DIR = _get_hermes_dir("platforms/matrix/store", "matrix/store")
 _CRYPTO_DB_PATH = _STORE_DIR / "crypto.db"
+_CREDENTIALS_PATH = _STORE_DIR / "matrix_creds.json"
 
 # Grace period: ignore messages older than this many seconds before startup.
 _STARTUP_GRACE_SECONDS = 5
@@ -601,6 +602,72 @@ class MatrixAdapter(BasePlatformAdapter):
         return True
 
     # ------------------------------------------------------------------
+    # Credential persistence — save access_token + device_id to disk
+    # so we don't need to re-login on every restart.
+    # ------------------------------------------------------------------
+
+    def _load_credentials(self) -> bool:
+        """Load persisted access_token and device_id from disk.
+
+        Returns True if credentials were loaded successfully.
+        """
+        if not _CREDENTIALS_PATH.exists():
+            return False
+        try:
+            import json as _json
+
+            with open(_CREDENTIALS_PATH) as f:
+                creds = _json.load(f)
+
+            token = creds.get("access_token", "")
+            device_id = creds.get("device_id", "")
+            user_id = creds.get("user_id", "")
+
+            if not token:
+                return False
+
+            # Only apply if not already set via env/config
+            if not self._access_token:
+                self._access_token = token
+            if not self._device_id and device_id:
+                self._device_id = device_id
+            if not self._user_id and user_id:
+                self._user_id = user_id
+
+            logger.info(
+                "Matrix: loaded persisted credentials (device %s)",
+                self._device_id or "(unknown)",
+            )
+            return True
+        except Exception as exc:
+            logger.debug("Matrix: failed to load persisted credentials: %s", exc)
+            return False
+
+    def _save_credentials(self, access_token: str, device_id: str) -> None:
+        """Save access_token and device_id to disk after password login."""
+        try:
+            import json as _json
+
+            _STORE_DIR.mkdir(parents=True, exist_ok=True)
+            creds = {
+                "access_token": access_token,
+                "device_id": device_id,
+                "user_id": self._user_id,
+                "saved_at": _json.dumps(
+                    __import__("datetime").datetime.utcnow().isoformat()
+                ),
+            }
+            with open(_CREDENTIALS_PATH, "w") as f:
+                _json.dump(creds, f, indent=2)
+            logger.info(
+                "Matrix: saved credentials to disk (device %s)", device_id
+            )
+        except Exception as exc:
+            logger.warning(
+                "Matrix: failed to save credentials to disk: %s", exc
+            )
+
+    # ------------------------------------------------------------------
     # Required overrides
     # ------------------------------------------------------------------
 
@@ -616,6 +683,9 @@ class MatrixAdapter(BasePlatformAdapter):
 
         # Ensure store dir exists for E2EE key persistence.
         _STORE_DIR.mkdir(parents=True, exist_ok=True)
+
+        # Try to load persisted credentials before attempting login.
+        self._load_credentials()
 
         # Create the HTTP API layer.
         client_session = _create_matrix_session(self._proxy_url)
@@ -677,8 +747,15 @@ class MatrixAdapter(BasePlatformAdapter):
                     device_name="Hermes Agent",
                     device_id=self._device_id or None,
                 )
+                saved_device_id = getattr(resp, "device_id", "") or ""
                 if resp and hasattr(resp, "device_id"):
                     client.device_id = resp.device_id
+                # Persist credentials so next restart doesn't need password login.
+                if resp and hasattr(resp, "access_token"):
+                    self._save_credentials(resp.access_token, saved_device_id)
+                    # Update in-memory state for this session
+                    self._access_token = resp.access_token
+                    api.token = resp.access_token
                 logger.info("Matrix: logged in as %s", self._user_id)
             except Exception as exc:
                 logger.error("Matrix: login failed — %s", exc)
